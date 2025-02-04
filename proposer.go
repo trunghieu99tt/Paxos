@@ -1,6 +1,7 @@
 package paxos
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -63,29 +64,56 @@ func (p *Proposer) preparePhase(proposalID ProposalID) (interface{}, bool) {
 	responses := make(chan PrepareResponse, len(p.acceptors))
 	var wg sync.WaitGroup
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	remaining := len(p.acceptors)
+	successCount := 0
+	var highestAcceptedID ProposalID
+	var highestAcceptedValue interface{}
+
 	for _, acceptor := range p.acceptors {
 		wg.Add(1)
 		go func(a *Acceptor) {
 			defer wg.Done()
 			response := a.HandlePrepare(prepareRequest)
-			responses <- response
+			select {
+			case responses <- response:
+			case <-ctx.Done():
+			}
 		}(acceptor)
 	}
 
-	wg.Wait()
-	close(responses)
+	go func() {
+		wg.Wait()
+		close(responses)
+	}()
 
-	successCount := 0
-	var highestAcceptedValue interface{}
-	var highestAcceptedID ProposalID
-
-	for response := range responses {
-		if response.Ok {
-			successCount++
-			if response.AcceptedID.GreaterThanOrEqual(highestAcceptedID) {
-				highestAcceptedID = response.AcceptedID
-				highestAcceptedValue = response.AcceptedValue
+	for remaining > 0 {
+		select {
+		case resp, ok := <-responses:
+			if !ok {
+				return highestAcceptedValue, successCount >= p.quorum
 			}
+			remaining--
+			if resp.Ok {
+				successCount++
+				if resp.AcceptedID.GreaterThanOrEqual(highestAcceptedID) {
+					highestAcceptedID = resp.AcceptedID
+					highestAcceptedValue = resp.AcceptedValue
+				}
+			}
+
+			if successCount >= p.quorum {
+				return highestAcceptedValue, true
+			}
+
+			if remaining+successCount < p.quorum {
+				return highestAcceptedValue, false
+			}
+
+		case <-ctx.Done():
+			return highestAcceptedValue, successCount >= p.quorum
 		}
 	}
 
