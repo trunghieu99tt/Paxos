@@ -2,10 +2,14 @@ package paxos
 
 import (
 	"context"
+	"fmt"
+	"log"
+	"sync"
 	"time"
 )
 
 type Proposer struct {
+	mu               sync.Mutex
 	sequence         uint64
 	id               uint32
 	quorum           uint32
@@ -63,9 +67,50 @@ func (p *Proposer) Run(ctx context.Context, value interface{}) (interface{}, err
 	}
 }
 
-func (p *Proposer) prepare(ctx context.Context, value interface{}) (proposalValue interface{}, ok bool, err error) {
-	p.sequence += 1
+func (p *Proposer) prepare(ctx context.Context, value interface{}) (interface{}, bool, error) {
+	p.mu.Lock()
+	p.sequence++
 	proposalID := p.proposalNumber()
+	p.mu.Unlock()
+
+	// Send prepare messages to all acceptors
+	if err := p.broadcastPrepare(ctx, proposalID); err != nil {
+		return nil, false, fmt.Errorf("failed to broadcast prepare: %w", err)
+	}
+
+	// Collect responses with timeout
+	timeoutCtx, cancel := context.WithTimeout(ctx, PrepareTimeout)
+	defer cancel()
+
+	responses := make(map[uint32]bool)
+	for len(responses) < len(p.acceptorNodeIds) {
+		msg, err := p.network.Receive(timeoutCtx, p.id, MessageTimeout)
+		if err != nil {
+			break // Timeout or error occurred
+		}
+
+		if !p.isValidPrepareResponse(msg, proposalID) {
+			continue
+		}
+
+		prepareResponse := msg.Value.(PrepareResponse)
+		p.mu.Lock()
+		if prepareResponse.Ok {
+			responses[msg.From] = true
+			p.acceptorPromises[msg.From] = &msg
+		}
+		hasQuorum := len(responses) >= int(p.quorum)
+		p.mu.Unlock()
+
+		if hasQuorum {
+			return p.highestAcceptedValue(value), true, nil
+		}
+	}
+
+	return nil, false, nil
+}
+
+func (p *Proposer) broadcastPrepare(ctx context.Context, proposalID int64) error {
 	for _, acceptorID := range p.acceptorNodeIds {
 		msg := Message{
 			From:  p.id,
@@ -74,33 +119,15 @@ func (p *Proposer) prepare(ctx context.Context, value interface{}) (proposalValu
 			Value: PrepareRequest{Number: proposalID},
 		}
 		if err := p.network.Send(ctx, msg); err != nil {
-			continue
+			log.Printf("Failed to send prepare to acceptor %d: %v", acceptorID, err)
 		}
 	}
+	return nil
+}
 
-	receivedResp := make(map[uint32]bool)
-	for !p.isPromiseQuorumReached() && len(receivedResp) < len(p.acceptorNodeIds) {
-		select {
-		case <-time.After(PrepareTimeout):
-			return
-		default:
-			msg, err := p.network.Receive(ctx, p.id, MessageTimeout)
-			if err == nil {
-				prepareResponse := msg.Value.(PrepareResponse)
-				if msg.Type == PromiseMessage && prepareResponse.Number == proposalID {
-					if prepareResponse.Ok {
-						receivedResp[msg.From] = true
-					}
-					if _, ok := p.acceptorPromises[msg.From]; ok {
-						p.acceptorPromises[msg.From] = &msg
-					}
-				}
-			}
-		}
-	}
-
-	highestAcceptedValue := p.highestAcceptedValue(value)
-	return highestAcceptedValue, true, nil
+func (p *Proposer) isValidPrepareResponse(msg Message, proposalID int64) bool {
+	return msg.Type == PromiseMessage &&
+		msg.Value.(PrepareResponse).Number == proposalID
 }
 
 func (p *Proposer) highestAcceptedValue(initialValue interface{}) interface{} {
@@ -146,24 +173,32 @@ func (p *Proposer) isPromiseQuorumReached() bool {
 func (p *Proposer) proposalNumber() int64 { return int64(p.sequence)<<16 | int64(p.id) }
 
 func (p *Proposer) isConsensusReached(ctx context.Context) bool {
-	okAcceptedResponseCnt := 0
-	acceptedResponseCnt := 0
-	for okAcceptedResponseCnt < int(p.quorum) && acceptedResponseCnt < len(p.acceptorNodeIds) {
-		select {
-		case <-time.After(AcceptTimeout):
-			return acceptedResponseCnt >= int(p.quorum)
-		default:
-			msg, err := p.network.Receive(ctx, p.id, MessageTimeout)
-			if err != nil {
-				continue
-			}
-			if msg.Type == AcceptedMessage {
-				acceptedResponseCnt += 1
-				if msg.Value.(AcceptResponse).Ok {
-					okAcceptedResponseCnt++
-				}
-			}
-		}
+	type acceptStats struct {
+		total int
+		ok    int
 	}
-	return acceptedResponseCnt >= int(p.quorum)
+
+	stats := &acceptStats{}
+	timeoutCtx, cancel := context.WithTimeout(ctx, AcceptTimeout)
+	defer cancel()
+
+	for stats.ok < int(p.quorum) && stats.total < len(p.acceptorNodeIds) {
+		msg, err := p.network.Receive(timeoutCtx, p.id, MessageTimeout)
+		if err != nil {
+			break
+		}
+
+		if msg.Type != AcceptedMessage {
+			continue
+		}
+
+		p.mu.Lock()
+		stats.total++
+		if msg.Value.(AcceptResponse).Ok {
+			stats.ok++
+		}
+		p.mu.Unlock()
+	}
+
+	return stats.total >= int(p.quorum)
 }

@@ -49,7 +49,9 @@ func (l *Learner) Run(ctx context.Context) (value interface{}, ok bool) {
 			l.receiveAccepted(accepted)
 			chosenValue, ok := l.chosen()
 			if ok {
+				l.mu.Lock()
 				l.value = chosenValue
+				l.mu.Unlock()
 				return chosenValue, true
 			}
 		}
@@ -84,6 +86,8 @@ func (l *Learner) majority() int {
 // The leader might choose multiple proposals when it learns multiple times,
 // but we guarantee that all chosen proposals have the same value.
 func (l *Learner) chosen() (interface{}, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	counts := make(map[int64]int)
 	acceptedCnt := make(map[int64]Message)
 

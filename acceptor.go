@@ -59,42 +59,24 @@ func (a *Acceptor) Run(ctx context.Context) error {
 func (a *Acceptor) HandlePrepare(ctx context.Context, msg Message) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if msg.Value == nil {
+		return nil
+	}
 
 	prepareRequest := msg.Value.(PrepareRequest)
-	if prepareRequest.Number < a.minNumber {
-		response := PrepareResponse{
-			Ok:     false,
-			Number: prepareRequest.Number,
-		}
-		return a.network.Send(ctx, Message{
-			From:  a.id,
-			To:    msg.From,
-			Type:  PromiseMessage,
-			Value: response,
-		})
-	}
-
-	a.minNumber = prepareRequest.Number
-	if a.acceptedValue == nil {
-		response := PrepareResponse{
-			Ok:             true,
-			Number:         a.minNumber,
-			AcceptedNumber: int64(0),
-			AcceptedValue:  nil,
-		}
-		return a.network.Send(ctx, Message{
-			From:  a.id,
-			To:    msg.From,
-			Type:  PromiseMessage,
-			Value: response,
-		})
-	}
-
 	response := PrepareResponse{
-		Number:         a.minNumber,
-		AcceptedNumber: a.acceptedNumber,
-		AcceptedValue:  a.acceptedValue,
+		Number: prepareRequest.Number,
+		Ok:     prepareRequest.Number >= a.minNumber,
 	}
+
+	if response.Ok {
+		a.minNumber = prepareRequest.Number
+		if a.acceptedValue != nil {
+			response.AcceptedNumber = a.acceptedNumber
+			response.AcceptedValue = a.acceptedValue
+		}
+	}
+
 	return a.network.Send(ctx, Message{
 		From:  a.id,
 		To:    msg.From,
@@ -108,38 +90,19 @@ func (a *Acceptor) HandleAccept(ctx context.Context, msg Message) error {
 	defer a.mu.Unlock()
 
 	acceptRequest := msg.Value.(AcceptRequest)
-	if acceptRequest.Number < a.minNumber {
-		response := AcceptResponse{
-			Number: a.acceptedNumber,
-			Ok:     false,
-		}
-		return a.network.Send(ctx, Message{
-			From:  a.id,
-			To:    msg.From,
-			Type:  AcceptedMessage,
-			Value: response,
-		})
-	}
-
-	a.acceptedNumber = acceptRequest.Number
-	a.acceptedValue = acceptRequest.Value
 	response := AcceptResponse{
 		Number: a.acceptedNumber,
-		Ok:     true,
-		Value:  a.acceptedValue,
+		Ok:     acceptRequest.Number >= a.minNumber,
 	}
 
-	for _, learnerID := range a.learnerIds {
-		go func(learnerID uint32) {
-			if err := a.network.Send(ctx, Message{
-				From:  a.id,
-				To:    learnerID,
-				Type:  LearnMessage,
-				Value: response,
-			}); err != nil {
-				log.Printf("Error sending learn message: %v", err)
-			}
-		}(learnerID)
+	if response.Ok {
+		a.acceptedNumber = acceptRequest.Number
+		a.acceptedValue = acceptRequest.Value
+		response.Number = a.acceptedNumber
+		response.Value = a.acceptedValue
+
+		// Notify learners in background
+		a.notifyLearners(ctx, response)
 	}
 
 	return a.network.Send(ctx, Message{
@@ -148,4 +111,19 @@ func (a *Acceptor) HandleAccept(ctx context.Context, msg Message) error {
 		Type:  AcceptedMessage,
 		Value: response,
 	})
+}
+
+func (a *Acceptor) notifyLearners(ctx context.Context, response AcceptResponse) {
+	for _, learnerID := range a.learnerIds {
+		go func(learnerID uint32) {
+			if err := a.network.Send(ctx, Message{
+				From:  a.id,
+				To:    learnerID,
+				Type:  LearnMessage,
+				Value: response,
+			}); err != nil {
+				log.Printf("Error sending learn message to %d: %v", learnerID, err)
+			}
+		}(learnerID)
+	}
 }
