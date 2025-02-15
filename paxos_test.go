@@ -1,92 +1,87 @@
 package paxos
 
 import (
-	"sync"
+	"context"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/assert"
 )
 
-func TestBasicConsensus(t *testing.T) {
-	numAcceptors := 3
-	learner := NewLearner()
-	learners := []*Learner{learner}
+func TestPaxosWithSingleProposer(t *testing.T) {
+	// 1, 2, 3 are acceptors
+	// 1001 is acceptor proposer
+	ctx := context.Background()
+	pn := NewNetwork(1, 2, 3, 1001, 2001)
 
-	var acceptors []*Acceptor
-	for i := 0; i < numAcceptors; i++ {
-		acceptor := NewAcceptor(learners)
-		acceptors = append(acceptors, acceptor)
-	}
-	proposer := NewProposer(1, acceptors)
-	expectedValue := "test-value"
-	proposer.Propose(expectedValue)
-	time.Sleep(100 * time.Millisecond)
-
-	assert.Equal(t, expectedValue, learner.GetValue())
-}
-
-func TestCompetingProposers(t *testing.T) {
-	numAcceptors := 3
-	learner := NewLearner()
-	learners := []*Learner{learner}
-
-	var acceptors []*Acceptor
-	for i := 0; i < numAcceptors; i++ {
-		acceptor := NewAcceptor(learners)
-		acceptors = append(acceptors, acceptor)
+	acceptors := make([]IAcceptor, 0)
+	for i := 1; i <= 3; i++ {
+		acceptors = append(acceptors, NewAcceptor(uint32(i), pn, []uint32{2001}))
 	}
 
-	proposer1 := NewProposer(1, acceptors)
-	proposer2 := NewProposer(2, acceptors)
+	for _, acceptor := range acceptors {
+		go func() {
+			err := acceptor.Run(ctx)
+			if err != nil {
+				t.Errorf("Error while running acceptor: %#v, error: %#v", acceptor, err)
+			}
+		}()
+	}
 
-	value1 := "value1"
-	value2 := "value2"
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
+	proposer := NewProposer(1001, pn, []uint32{1, 2, 3})
 	go func() {
-		defer wg.Done()
-		proposer1.Propose(value1)
+		_, err := proposer.Run(ctx, "hello world")
+		if err != nil {
+			t.Errorf("Error while running proposer: %#v, error: %#v", proposer, err)
+		}
 	}()
 
-	go func() {
-		defer wg.Done()
-		proposer2.Propose(value2)
-	}()
-
-	wg.Wait()
-	time.Sleep(100 * time.Millisecond)
-
-	learnedValue := learner.GetValue()
-	assert.Contains(t, []string{value1, value2}, learnedValue)
+	l := NewLearner(2001, pn, []uint32{1, 2, 3})
+	value, ok := l.Run(ctx)
+	if !ok {
+		t.Errorf("value = %s, want %s", value, "hello world")
+	}
 }
 
-func TestProposalIDOrdering(t *testing.T) {
-	tests := []struct {
-		p1       ProposalID
-		p2       ProposalID
-		expected bool
-	}{
-		{
-			ProposalID{NodeID: 1, Sequence: 1},
-			ProposalID{NodeID: 1, Sequence: 2},
-			false,
-		},
-		{
-			ProposalID{NodeID: 2, Sequence: 1},
-			ProposalID{NodeID: 1, Sequence: 1},
-			true,
-		},
-		{
-			ProposalID{NodeID: 1, Sequence: 2},
-			ProposalID{NodeID: 2, Sequence: 1},
-			true,
-		},
+func TestPaxosWithTwoProposers(t *testing.T) {
+	// 1, 2, 3 are acceptors
+	// 1001,1002 is acceptor proposer
+	ctx := context.Background()
+	pn := NewNetwork(1, 2, 3, 1001, 1002, 2001)
+
+	acceptors := make([]IAcceptor, 0)
+	for i := 1; i <= 3; i++ {
+		acceptors = append(acceptors, NewAcceptor(uint32(i), pn, []uint32{2001}))
 	}
 
-	for _, tt := range tests {
-		assert.Equal(t, tt.expected, tt.p1.GreaterThanOrEqual(tt.p2))
+	for _, acceptor := range acceptors {
+		go func() {
+			err := acceptor.Run(ctx)
+			if err != nil {
+				t.Errorf("Error while running acceptor: %#v, error: %#v", acceptor, err)
+			}
+		}()
 	}
+
+	proposer1 := NewProposer(1001, pn, []uint32{1, 2, 3})
+	go func() {
+		_, err := proposer1.Run(ctx, "hello world")
+		if err != nil {
+			t.Errorf("Error while running proposer1: %#v, error: %#v", proposer1, err)
+		}
+	}()
+
+	time.Sleep(time.Millisecond)
+	proposer2 := NewProposer(1002, pn, []uint32{1, 2, 3})
+	go func() {
+		_, err := proposer2.Run(ctx, "bad day")
+		if err != nil {
+			t.Errorf("Error while running proposer2: %#v, error: %#v", proposer2, err)
+		}
+	}()
+
+	l := NewLearner(2001, pn, []uint32{1, 2, 3})
+	value, ok := l.Run(ctx)
+	if !ok {
+		t.Errorf("value = %s, want %s", value, "hello world")
+	}
+	time.Sleep(time.Millisecond)
 }

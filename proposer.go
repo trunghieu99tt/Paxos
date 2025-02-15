@@ -2,143 +2,168 @@ package paxos
 
 import (
 	"context"
-	"fmt"
-	"sync"
 	"time"
 )
 
 type Proposer struct {
-	mu        sync.Mutex
-	acceptors []*Acceptor
-	quorum    int
-	nodeID    int
-	sequence  int
+	sequence         uint64
+	id               uint32
+	quorum           uint32
+	network          INetwork
+	acceptorNodeIds  []uint32
+	acceptorPromises map[uint32]*Message
 }
 
-func NewProposer(nodeID int, acceptors []*Acceptor) *Proposer {
+type IProposer interface {
+	Run(ctx context.Context, value interface{}) (interface{}, error)
+}
+
+func NewProposer(id uint32, network INetwork, acceptors []uint32) IProposer {
+	acceptorPromises := make(map[uint32]*Message, len(acceptors))
+	for _, acceptorID := range acceptors {
+		acceptorPromises[acceptorID] = &Message{Type: DumbMessage}
+	}
 	return &Proposer{
-		acceptors: acceptors,
-		quorum:    len(acceptors)/2 + 1,
-		nodeID:    nodeID,
-		sequence:  0,
+		quorum:           uint32(len(acceptors)/2 + 1),
+		id:               id,
+		sequence:         0,
+		network:          network,
+		acceptorNodeIds:  acceptors,
+		acceptorPromises: acceptorPromises,
 	}
 }
 
-func (p *Proposer) newProposalID() ProposalID {
-	p.sequence++
-	return ProposalID{NodeID: p.nodeID, Sequence: p.sequence}
+func (p *Proposer) Run(ctx context.Context, value interface{}) (interface{}, error) {
+	for {
+		select {
+		case <-time.After(ProposerRunDur):
+			return nil, nil
+		default:
+			proposalValue, ok, err := p.prepare(ctx, value)
+			if err != nil {
+				return nil, err
+			}
+
+			// Prepare phase failed, backoff and retry
+			if !ok {
+				time.Sleep(ProposerBackoff)
+				ProposerBackoff *= BackoffFactor
+				continue
+			}
+
+			p.sendAccept(ctx, proposalValue)
+			if p.isConsensusReached(ctx) {
+				return proposalValue, nil
+			}
+
+			// Accept phase failed, backoff and retry
+			time.Sleep(ProposerBackoff)
+			ProposerBackoff *= BackoffFactor
+		}
+	}
 }
 
-func (p *Proposer) Propose(value interface{}) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	backoff := 50 * time.Millisecond
-	for {
-		proposalID := p.newProposalID()
-		highestAcceptedValue, ok := p.preparePhase(proposalID)
-		if !ok {
-			fmt.Println("Prepare phase failed. Retrying...")
-			time.Sleep(backoff)
-			backoff *= 2
+func (p *Proposer) prepare(ctx context.Context, value interface{}) (proposalValue interface{}, ok bool, err error) {
+	p.sequence += 1
+	proposalID := p.proposalNumber()
+	for _, acceptorID := range p.acceptorNodeIds {
+		msg := Message{
+			From:  p.id,
+			To:    acceptorID,
+			Type:  PrepareMessage,
+			Value: PrepareRequest{Number: proposalID},
+		}
+		if err := p.network.Send(ctx, msg); err != nil {
 			continue
 		}
-
-		if highestAcceptedValue == nil {
-			highestAcceptedValue = value
-		}
-
-		if p.acceptPhase(proposalID, highestAcceptedValue) {
-			fmt.Println("Proposal accepted:", highestAcceptedValue)
-			break
-		}
-
-		fmt.Println("Accept phase failed. Retrying...")
-		time.Sleep(backoff)
-		backoff *= 2
-	}
-}
-
-func (p *Proposer) preparePhase(proposalID ProposalID) (interface{}, bool) {
-	prepareRequest := PrepareRequest{ProposalID: proposalID}
-	responses := make(chan PrepareResponse, len(p.acceptors))
-	var wg sync.WaitGroup
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	remaining := len(p.acceptors)
-	successCount := 0
-	var highestAcceptedID ProposalID
-	var highestAcceptedValue interface{}
-
-	for _, acceptor := range p.acceptors {
-		wg.Add(1)
-		go func(a *Acceptor) {
-			defer wg.Done()
-			response := a.HandlePrepare(prepareRequest)
-			select {
-			case responses <- response:
-			case <-ctx.Done():
-			}
-		}(acceptor)
 	}
 
-	go func() {
-		wg.Wait()
-		close(responses)
-	}()
-
-	for remaining > 0 {
+	receivedResp := make(map[uint32]bool)
+	for !p.isPromiseQuorumReached() && len(receivedResp) < len(p.acceptorNodeIds) {
 		select {
-		case resp, ok := <-responses:
-			if !ok {
-				return highestAcceptedValue, successCount >= p.quorum
-			}
-			remaining--
-			if resp.Ok {
-				successCount++
-				if resp.AcceptedID.GreaterThanOrEqual(highestAcceptedID) {
-					highestAcceptedID = resp.AcceptedID
-					highestAcceptedValue = resp.AcceptedValue
+		case <-time.After(PrepareTimeout):
+			return
+		default:
+			msg, err := p.network.Receive(ctx, p.id, MessageTimeout)
+			if err == nil {
+				prepareResponse := msg.Value.(PrepareResponse)
+				if msg.Type == PromiseMessage && prepareResponse.Number == proposalID {
+					if prepareResponse.Ok {
+						receivedResp[msg.From] = true
+					}
+					if _, ok := p.acceptorPromises[msg.From]; ok {
+						p.acceptorPromises[msg.From] = &msg
+					}
 				}
 			}
-
-			if successCount >= p.quorum {
-				return highestAcceptedValue, true
-			}
-
-			if remaining+successCount < p.quorum {
-				return highestAcceptedValue, false
-			}
-
-		case <-ctx.Done():
-			return highestAcceptedValue, successCount >= p.quorum
 		}
 	}
 
-	return highestAcceptedValue, successCount >= p.quorum
+	highestAcceptedValue := p.highestAcceptedValue(value)
+	return highestAcceptedValue, true, nil
 }
 
-func (p *Proposer) acceptPhase(proposalID ProposalID, value interface{}) bool {
-	acceptRequest := AcceptRequest{ProposalID: proposalID, Value: value}
-	var mu sync.Mutex
-	successCount := 0
-	var wg sync.WaitGroup
-
-	for _, acceptor := range p.acceptors {
-		wg.Add(1)
-		go func(a *Acceptor) {
-			defer wg.Done()
-			response := a.HandleAccept(acceptRequest)
-			if response.Ok {
-				mu.Lock()
-				successCount++
-				mu.Unlock()
-			}
-		}(acceptor)
+func (p *Proposer) highestAcceptedValue(initialValue interface{}) interface{} {
+	highestAcceptedID := int64(0)
+	highestAcceptedValue := initialValue
+	for _, promise := range p.acceptorPromises {
+		if promise.Value == nil {
+			continue
+		}
+		response := promise.Value.(PrepareResponse)
+		if response.AcceptedNumber > highestAcceptedID {
+			highestAcceptedID = response.Number
+			highestAcceptedValue = response.AcceptedValue
+		}
 	}
+	return highestAcceptedValue
+}
 
-	wg.Wait()
-	return successCount >= p.quorum
+func (p *Proposer) sendAccept(ctx context.Context, value interface{}) {
+	for _, acceptorID := range p.acceptorNodeIds {
+		msg := Message{
+			From:  p.id,
+			To:    acceptorID,
+			Type:  AcceptMessage,
+			Value: AcceptRequest{Number: p.proposalNumber(), Value: value},
+		}
+		if err := p.network.Send(ctx, msg); err != nil {
+			continue
+		}
+	}
+}
+
+func (p *Proposer) isPromiseQuorumReached() bool {
+	acceptedCount := 0
+	for _, promise := range p.acceptorPromises {
+		if promise.Type == PromiseMessage && promise.Value.(PrepareResponse).Number == p.proposalNumber() {
+			acceptedCount++
+		}
+	}
+	return acceptedCount >= int(p.quorum)
+}
+
+func (p *Proposer) proposalNumber() int64 { return int64(p.sequence)<<16 | int64(p.id) }
+
+func (p *Proposer) isConsensusReached(ctx context.Context) bool {
+	okAcceptedResponseCnt := 0
+	acceptedResponseCnt := 0
+	for okAcceptedResponseCnt < int(p.quorum) && acceptedResponseCnt < len(p.acceptorNodeIds) {
+		select {
+		case <-time.After(AcceptTimeout):
+			return acceptedResponseCnt >= int(p.quorum)
+		default:
+			msg, err := p.network.Receive(ctx, p.id, MessageTimeout)
+			if err != nil {
+				continue
+			}
+			if msg.Type == AcceptedMessage {
+				acceptedResponseCnt += 1
+				if msg.Value.(AcceptResponse).Ok {
+					okAcceptedResponseCnt++
+				}
+			}
+		}
+	}
+	return acceptedResponseCnt >= int(p.quorum)
 }

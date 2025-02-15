@@ -1,34 +1,52 @@
 package paxos
 
-type ProposalID struct {
-	NodeID   int
-	Sequence int
-}
-
-func (p ProposalID) GreaterThanOrEqual(other ProposalID) bool {
-	return p.Sequence >= other.Sequence || (p.Sequence == other.Sequence && p.NodeID >= other.NodeID)
-}
-
-type Proposal struct {
-	ID    ProposalID
-	Value interface{}
-}
+import "fmt"
 
 type PrepareRequest struct {
-	ProposalID ProposalID
+	Number int64
 }
 
 type PrepareResponse struct {
-	Ok            bool
-	AcceptedID    ProposalID
-	AcceptedValue interface{}
+	Number         int64
+	AcceptedNumber int64
+	Ok             bool
+	AcceptedValue  interface{}
 }
 
 type AcceptRequest struct {
-	ProposalID ProposalID
-	Value      interface{}
+	Number int64
+	Value  interface{}
 }
 
 type AcceptResponse struct {
-	Ok bool
-} 
+	Number int64
+	Ok     bool
+	Value  interface{}
+}
+
+type LearnResponse struct {
+	Number int64
+	Value  interface{}
+}
+
+type MessageType int
+
+const (
+	DumbMessage MessageType = iota
+	PrepareMessage
+	PromiseMessage
+	AcceptMessage
+	AcceptedMessage
+	LearnMessage
+)
+
+type Message struct {
+	From  uint32
+	To    uint32
+	Type  MessageType
+	Value interface{}
+}
+
+func (m Message) String() string {
+	return fmt.Sprintf("Message{from: %d, to: %d, msgType: %d, value: %#v}", m.From, m.To, m.Type, m.Value)
+}
